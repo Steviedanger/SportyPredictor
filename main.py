@@ -1,25 +1,32 @@
-from __future__ import annotations
-
 import logging
 from scraper import ingest_teams_and_fixtures
+from elo_updater import update_elo_ratings
 from predictor import generate_predictions
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("sporty.main")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+logger = logging.getLogger("sporty.main")
+
 
 def run_pipeline() -> None:
-    log.info("Starting SportyPredictor daily pipeline...")
+    logger.info("Starting SportyPredictor daily pipeline...")
     try:
-        log.info("--- Step 1: Ingesting fixtures & team data ---")
+        logger.info("--- Step 1: Ingesting fixtures & team data ---")
         ingest_teams_and_fixtures()
-        
-        log.info("--- Step 2: Running Poisson + Elo prediction engine ---")
+
+        logger.info("--- Step 2: Updating team Elo ratings from finished matches ---")
+        update_elo_ratings()
+
+        logger.info("--- Step 3: Running Poisson + Elo prediction engine ---")
         generate_predictions()
-        
-        log.info("SportyPredictor daily pipeline completed successfully!")
+
+        logger.info("SportyPredictor pipeline completed successfully!")
     except Exception as exc:
-        log.error("Pipeline failed with error: %s", exc)
+        logger.error("Pipeline failed with error: %s", exc)
         raise exc
+
 
 if __name__ == "__main__":
     run_pipeline()
