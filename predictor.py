@@ -90,7 +90,7 @@ def generate_predictions() -> None:
             "predicted_score": preds["predicted_score"]
         }
         
-        SUPABASE.table("predictions").upsert(prediction_payload).execute()
+        SUPABASE.table("predictions").upsert(prediction_payload, on_conflict="match_id").execute()
         log.info("Generated prediction for Match ID %s: %s", m["id"], preds["predicted_score"])
 
     log.info("Phase 2 Prediction generation complete!")
