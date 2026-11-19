@@ -54,7 +54,7 @@ def fetch_upcoming_matches() -> list[dict]:
     return payload.get("matches", [])
 
 
-def ingest_fixtures() -> None:
+def ingest_teams_and_fixtures() -> None:
     matches = fetch_upcoming_matches()
     logger.info("Found %d scheduled matches to process.", len(matches))
 
@@ -70,7 +70,6 @@ def ingest_fixtures() -> None:
         home_id = home.get("id")
         away_id = away.get("id")
 
-        # Skip placeholder/TBD knockout fixtures that lack concrete team IDs
         if not home_id or not away_id:
             continue
 
@@ -119,4 +118,4 @@ def ingest_fixtures() -> None:
 
 
 if __name__ == "__main__":
-    ingest_fixtures()
+    ingest_teams_and_fixtures()
