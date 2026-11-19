@@ -2,8 +2,8 @@ name: SportyPredictor Daily Pipeline
 
 on:
   schedule:
-    - cron: '0 6,18 * * *' # Runs twice daily at 06:00 and 18:00 UTC
-  workflow_dispatch: # Allows you to manually trigger runs from GitHub anytime
+    - cron: '0 6,18 * * *'
+  workflow_dispatch:
 
 jobs:
   run-pipeline:
