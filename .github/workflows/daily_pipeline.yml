@@ -27,4 +27,8 @@ jobs:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
           FOOTBALL_DATA_API_KEY: ${{ secrets.FOOTBALL_DATA_API_KEY }}
-        run: python main.py
+        run:    |
+          test -n "$SUPABASE_URL" && echo "SUPABASE_URL is set" || echo "SUPABASE_URL is EMPTY"
+          test -n "$SUPABASE_KEY" && echo "SUPABASE_KEY is set" || echo "SUPABASE_KEY is EMPTY"
+          test -n "$FOOTBALL_DATA_API_KEY" && echo "FOOTBALL_DATA_API_KEY is set" || echo "FOOTBALL_DATA_API_KEY is EMPTY"
+          python main.py
