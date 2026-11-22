@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import logging
-import math
 import os
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from supabase import Client, create_client
+
+from goals_model import (
+    DEFAULT_AWAY_GOALS,
+    DEFAULT_EXPONENT,
+    DEFAULT_HOME_GOALS,
+    expected_goals,
+    score_summary,
+)
 
 load_dotenv()
 logging.basicConfig(level=logging.INFO)
@@ -20,71 +27,67 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # Bump this whenever the model changes, so results of different models are never mixed.
-MODEL_VERSION = "elo-poisson-v1"
+MODEL_VERSION = "elo-poisson-v2"
 
 
-def poisson_probability(lmbda: float, k: int) -> float:
-    """Calculates the Poisson probability of k events occurring given expected rate lmbda."""
-    return (math.exp(-lmbda) * (lmbda**k)) / math.factorial(k)
-
-
-def calculate_match_probabilities(home_elo: float, away_elo: float) -> dict:
+def calculate_match_probabilities(
+    home_elo: float,
+    away_elo: float,
+    home_avg: float,
+    away_avg: float,
+    exponent: float,
+) -> dict:
     """
-    Elo-scaled Poisson model where 1X2, Over 2.5, and predicted_score
-    all derive directly from the same scoreline probability matrix.
+    Elo-scaled Poisson model. Expected goals come from the league's average goals
+    scaled by the rating gap; 1X2, Over 2.5 and the likeliest score all derive
+    from the same scoreline grid.
     """
-    elo_diff = home_elo - away_elo
-    strength_factor = 10.0 ** (elo_diff / 400.0)
-
-    # Dynamic expected goals per side (allows total expected goals to move above/below 2.5)
-    home_lambda = max(0.35, min(3.8, 1.35 * math.sqrt(strength_factor)))
-    away_lambda = max(0.30, min(3.4, 1.05 / math.sqrt(strength_factor)))
-
-    max_goals = 6
-    grid: list[tuple[int, int, float]] = []
-    total_mass = 0.0
-
-    for h in range(max_goals + 1):
-        p_h = poisson_probability(home_lambda, h)
-        for a in range(max_goals + 1):
-            p = p_h * poisson_probability(away_lambda, a)
-            grid.append((h, a, p))
-            total_mass += p
-
-    # Normalize across the scoreline grid so probabilities stay consistent
-    normalized_grid = [
-        (h, a, p / total_mass) for (h, a, p) in grid if total_mass > 0
-    ]
-
-    home_win_prob = 0.0
-    draw_prob = 0.0
-    away_win_prob = 0.0
-    over_25_prob = 0.0
-
-    best_h, best_a, max_score_prob = 1, 1, -1.0
-
-    for h, a, p in normalized_grid:
-        if h > a:
-            home_win_prob += p
-        elif h == a:
-            draw_prob += p
-        else:
-            away_win_prob += p
-
-        if (h + a) > 2.5:
-            over_25_prob += p
-
-        if p > max_score_prob:
-            max_score_prob = p
-            best_h, best_a = h, a
+    lam_h, lam_a = expected_goals(home_elo, away_elo, home_avg, away_avg, exponent)
+    s = score_summary(lam_h, lam_a)
 
     return {
-        "home_win": round(home_win_prob, 3),
-        "draw": round(draw_prob, 3),
-        "away_win": round(away_win_prob, 3),
-        "over_25": round(over_25_prob, 3),
-        "predicted_score": f"{best_h}-{best_a}",
+        "home_win": round(s["home_win"], 3),
+        "draw": round(s["draw"], 3),
+        "away_win": round(s["away_win"], 3),
+        "over_25": round(s["over_25"], 3),
+        "predicted_score": s["predicted_score"],
+        "home_xg": round(s["home_xg"], 2),
+        "away_xg": round(s["away_xg"], 2),
     }
+
+
+def load_goal_params() -> tuple[dict[str, tuple[float, float]], float, bool]:
+    """League goal averages and the fitted Elo exponent, saved by elo_updater.py."""
+    stats: dict[str, tuple[float, float]] = {}
+    exponent = DEFAULT_EXPONENT
+    exponent_found = False
+
+    try:
+        rows = (
+            SUPABASE.table("league_stats")
+            .select("league, avg_home_goals, avg_away_goals")
+            .execute()
+            .data
+            or []
+        )
+        for r in rows:
+            stats[r["league"]] = (float(r["avg_home_goals"]), float(r["avg_away_goals"]))
+
+        param_rows = (
+            SUPABASE.table("model_params")
+            .select("value")
+            .eq("name", "elo_goal_exponent")
+            .execute()
+            .data
+            or []
+        )
+        if param_rows:
+            exponent = float(param_rows[0]["value"])
+            exponent_found = True
+    except Exception as exc:
+        log.warning("Could not load fitted goal parameters, using fallbacks: %s", exc)
+
+    return stats, exponent, bool(stats) and exponent_found
 
 
 def generate_predictions() -> None:
@@ -93,7 +96,7 @@ def generate_predictions() -> None:
 
     res = (
         SUPABASE.table("matches")
-        .select("id, home_team_id, away_team_id, status, kickoff")
+        .select("id, league, home_team_id, away_team_id, status, kickoff")
         .in_("status", ["SCHEDULED", "TIMED"])
         .gte("kickoff", now_iso)
         .execute()
@@ -110,14 +113,38 @@ def generate_predictions() -> None:
         for t in (teams_res.data or [])
     }
 
+    league_stats, exponent, fitted = load_goal_params()
+    if league_stats:
+        fallback_home = sum(h for h, _ in league_stats.values()) / len(league_stats)
+        fallback_away = sum(a for _, a in league_stats.values()) / len(league_stats)
+    else:
+        fallback_home, fallback_away = DEFAULT_HOME_GOALS, DEFAULT_AWAY_GOALS
+
+    # If fitted values are missing, say so in the record instead of passing it off as v2.
+    model_version = MODEL_VERSION if fitted else f"{MODEL_VERSION}-fallback"
+    log.info(
+        "Goal model: version=%s exponent=%.2f leagues with stats=%d",
+        model_version,
+        exponent,
+        len(league_stats),
+    )
+
     predictions_batch: list[dict] = []
     log_batch: list[dict] = []
+    unknown_league = 0
 
     for m in matches:
         home_elo = elo_map.get(m["home_team_id"], 1500.0)
         away_elo = elo_map.get(m["away_team_id"], 1500.0)
 
-        preds = calculate_match_probabilities(home_elo, away_elo)
+        league = m.get("league")
+        if league in league_stats:
+            home_avg, away_avg = league_stats[league]
+        else:
+            home_avg, away_avg = fallback_home, fallback_away
+            unknown_league += 1
+
+        preds = calculate_match_probabilities(home_elo, away_elo, home_avg, away_avg, exponent)
 
         predictions_batch.append(
             {
@@ -127,6 +154,8 @@ def generate_predictions() -> None:
                 "away_win_prob": preds["away_win"],
                 "over_25_prob": preds["over_25"],
                 "predicted_score": preds["predicted_score"],
+                "home_xg": preds["home_xg"],
+                "away_xg": preds["away_xg"],
             }
         )
 
@@ -135,7 +164,7 @@ def generate_predictions() -> None:
         log_batch.append(
             {
                 "match_id": m["id"],
-                "model_version": MODEL_VERSION,
+                "model_version": model_version,
                 "kickoff": m["kickoff"],
                 "last_updated_at": now_iso,
                 "home_elo": round(home_elo, 2),
@@ -145,8 +174,13 @@ def generate_predictions() -> None:
                 "away_win_prob": preds["away_win"],
                 "over_25_prob": preds["over_25"],
                 "predicted_score": preds["predicted_score"],
+                "home_xg": preds["home_xg"],
+                "away_xg": preds["away_xg"],
             }
         )
+
+    if unknown_league:
+        log.info("%d matches used the average of all leagues (no stats for their league name).", unknown_league)
 
     SUPABASE.table("predictions").upsert(
         predictions_batch,

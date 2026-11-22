@@ -14,6 +14,8 @@ interface Prediction {
   away_win_prob: number;
   over_25_prob: number;
   predicted_score: string;
+  home_xg?: number | null;
+  away_xg?: number | null;
 }
 
 interface MatchRow {
@@ -57,32 +59,17 @@ function getMatchResultTip(match: MatchRow, pred: Prediction | null) {
 }
 
 function getGoalsTipFromScoreline(pred: Prediction | null) {
-  if (!pred) return { label: 'Pending', prob: 0, scoreTotal: 0 };
+  if (!pred) return { label: 'Pending', prob: 0 };
 
-  const parts = (pred.predicted_score || '0-0')
-    .split('-')
-    .map((n) => Number.parseInt(n.trim(), 10));
-  const h = Number.isFinite(parts[0]) ? parts[0] : 0;
-  const a = Number.isFinite(parts[1]) ? parts[1] : 0;
-  const scoreTotal = h + a;
-
+  // The single likeliest scoreline is almost always low (1-0, 1-1, 0-1) even when
+  // expected goals are high, so the goals tip follows the over-2.5 probability.
   const overProb = pred.over_25_prob ?? 0;
   const underProb = Math.max(0, 1 - overProb);
 
-  // Align goals tip directly with the predicted scoreline total & probability
-  if (scoreTotal >= 3 || overProb >= 0.55) {
-    return {
-      label: 'Over 2.5 Goals',
-      prob: overProb,
-      scoreTotal,
-    };
+  if (overProb >= underProb) {
+    return { label: 'Over 2.5 Goals', prob: overProb };
   }
-
-  return {
-    label: 'Under 2.5 Goals',
-    prob: underProb,
-    scoreTotal,
-  };
+  return { label: 'Under 2.5 Goals', prob: underProb };
 }
 
 function isConfidentTeamElo(elo?: number): boolean {
@@ -220,7 +207,7 @@ function PredictionsBoard() {
           status,
           home_team:teams!matches_home_team_id_fkey(name, elo),
           away_team:teams!matches_away_team_id_fkey(name, elo),
-          predictions(home_win_prob, draw_prob, away_win_prob, over_25_prob, predicted_score)
+          predictions(home_win_prob, draw_prob, away_win_prob, over_25_prob, predicted_score, home_xg, away_xg)
         `)
         .gte('kickoff', startOfToday.toISOString())
         .order('kickoff', { ascending: true });
@@ -543,8 +530,17 @@ function PredictionsBoard() {
                                 </span>
                               </div>
 
+                              {pred.home_xg != null && pred.away_xg != null && (
+                                <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs">
+                                  <span className="text-slate-400 mr-1.5">Exp. goals:</span>
+                                  <span className="font-mono font-bold text-slate-100">
+                                    {pred.home_xg.toFixed(1)} – {pred.away_xg.toFixed(1)}
+                                  </span>
+                                </div>
+                              )}
+
                               <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs">
-                                <span className="text-slate-400 mr-1.5">Score:</span>
+                                <span className="text-slate-400 mr-1.5">Likeliest score:</span>
                                 <span className="font-mono font-bold text-slate-100">
                                   {pred.predicted_score}
                                 </span>
