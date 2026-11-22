@@ -26,31 +26,139 @@ interface MatchRow {
   predictions: Prediction[] | Prediction | null;
 }
 
+interface RolloverPick {
+  matchId: number;
+  league: string;
+  kickoff: string;
+  fixtureLabel: string;
+  pickLabel: string;
+  prob: number;
+  impliedOdds: number;
+}
+
 function getPrediction(preds: MatchRow['predictions']): Prediction | null {
   if (!preds) return null;
   return Array.isArray(preds) ? preds[0] ?? null : preds;
 }
 
-function getBestTip(match: MatchRow, pred: Prediction | null) {
-  if (!pred) return { label: 'Pending', confidence: null };
+function getMatchResultTip(match: MatchRow, pred: Prediction | null) {
+  if (!pred) return { label: 'Pending', prob: 0 };
 
   const homeName = match.home_team?.name ?? 'Home';
   const awayName = match.away_team?.name ?? 'Away';
 
-  const candidates = [
+  const options = [
     { label: `${homeName} Win`, prob: pred.home_win_prob ?? 0 },
     { label: 'Draw', prob: pred.draw_prob ?? 0 },
     { label: `${awayName} Win`, prob: pred.away_win_prob ?? 0 },
-    { label: 'Over 2.5 Goals', prob: pred.over_25_prob ?? 0 },
   ];
 
-  const best = candidates.reduce((prev, curr) =>
-    curr.prob > prev.prob ? curr : prev
-  );
+  return options.reduce((best, curr) => (curr.prob > best.prob ? curr : best));
+}
+
+function getGoalsTipFromScoreline(pred: Prediction | null) {
+  if (!pred) return { label: 'Pending', prob: 0, scoreTotal: 0 };
+
+  const parts = (pred.predicted_score || '0-0')
+    .split('-')
+    .map((n) => Number.parseInt(n.trim(), 10));
+  const h = Number.isFinite(parts[0]) ? parts[0] : 0;
+  const a = Number.isFinite(parts[1]) ? parts[1] : 0;
+  const scoreTotal = h + a;
+
+  const overProb = pred.over_25_prob ?? 0;
+  const underProb = Math.max(0, 1 - overProb);
+
+  // Align goals tip directly with the predicted scoreline total & probability
+  if (scoreTotal >= 3 || overProb >= 0.55) {
+    return {
+      label: 'Over 2.5 Goals',
+      prob: overProb,
+      scoreTotal,
+    };
+  }
 
   return {
-    label: best.label,
-    confidence: `${(best.prob * 100).toFixed(0)}%`,
+    label: 'Under 2.5 Goals',
+    prob: underProb,
+    scoreTotal,
+  };
+}
+
+function isConfidentTeamElo(elo?: number): boolean {
+  if (elo === undefined || elo === null) return false;
+  // Exclude uncalibrated/default ~1500 teams where we lack strong rating separation
+  return Math.abs(elo - 1500) >= 25;
+}
+
+function buildDailyThreeOddsRollover(matches: MatchRow[]): {
+  picks: RolloverPick[];
+  combinedOdds: number;
+} {
+  const candidates: RolloverPick[] = [];
+
+  for (const match of matches) {
+    const pred = getPrediction(match.predictions);
+    if (!pred) continue;
+
+    const homeElo = match.home_team?.elo;
+    const awayElo = match.away_team?.elo;
+
+    // Skip if either team is uncertain / still at default 1500 baseline
+    if (!isConfidentTeamElo(homeElo) || !isConfidentTeamElo(awayElo)) {
+      continue;
+    }
+
+    const homeName = match.home_team?.name ?? 'Home';
+    const awayName = match.away_team?.name ?? 'Away';
+    const goalsTip = getGoalsTipFromScoreline(pred);
+
+    const marketChoices = [
+      { label: `${homeName} Win`, prob: pred.home_win_prob ?? 0 },
+      { label: `${awayName} Win`, prob: pred.away_win_prob ?? 0 },
+      { label: goalsTip.label, prob: goalsTip.prob },
+    ];
+
+    const topMarket = marketChoices.reduce((best, curr) =>
+      curr.prob > best.prob ? curr : best
+    );
+
+    // Require solid conviction so uncertain fixtures never enter the 3-odds rollover
+    if (topMarket.prob < 0.54) continue;
+
+    // Approximate decimal odds with a modest margin factor (~0.92)
+    const rawFairOdds = topMarket.prob > 0 ? 1 / topMarket.prob : 1;
+    const impliedOdds = Number(Math.max(1.12, rawFairOdds * 0.92).toFixed(2));
+
+    candidates.push({
+      matchId: match.id,
+      league: match.league || 'Competition',
+      kickoff: match.kickoff,
+      fixtureLabel: `${homeName} vs ${awayName}`,
+      pickLabel: topMarket.label,
+      prob: topMarket.prob,
+      impliedOdds,
+    });
+  }
+
+  // Sort by highest probability first, then select up to 3 picks targeting ~3.00 combined odds
+  candidates.sort((a, b) => b.prob - a.prob);
+
+  const selected: RolloverPick[] = [];
+  let runningOdds = 1.0;
+
+  for (const pick of candidates) {
+    if (selected.length >= 3) break;
+    const nextOdds = runningOdds * pick.impliedOdds;
+    // Avoid blowing past ~3.60x if we already have 2 solid picks near 3.00x
+    if (selected.length >= 2 && nextOdds > 3.6) continue;
+    selected.push(pick);
+    runningOdds = nextOdds;
+  }
+
+  return {
+    picks: selected,
+    combinedOdds: Number(runningOdds.toFixed(2)),
   };
 }
 
@@ -62,7 +170,7 @@ function toDayKey(isoString: string) {
   return `${year}-${month}-${day}`;
 }
 
-function formatDayTabLabel(dayKey: string, index: number) {
+function formatDayTabLabel(dayKey: string) {
   const [y, m, d] = dayKey.split('-').map(Number);
   const dateObj = new Date(y, m - 1, d);
   const shortDate = dateObj.toLocaleDateString('en-GB', {
@@ -71,8 +179,12 @@ function formatDayTabLabel(dayKey: string, index: number) {
     month: 'short',
   });
 
-  if (index === 0) return `Today · ${shortDate}`;
-  if (index === 1) return `Tomorrow · ${shortDate}`;
+  const now = new Date();
+  const todayKey = toDayKey(now.toISOString());
+  const tomorrowKey = toDayKey(new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString());
+
+  if (dayKey === todayKey) return `Today · ${shortDate}`;
+  if (dayKey === tomorrowKey) return `Tomorrow · ${shortDate}`;
   return shortDate;
 }
 
@@ -93,6 +205,12 @@ function PredictionsBoard() {
 
     async function load() {
       setLoading(true);
+
+      // Past matches keep stale predictions (the predictor only refreshes upcoming
+      // games), so only load fixtures from the start of today onward.
+      const startOfToday = new Date();
+      startOfToday.setHours(0, 0, 0, 0);
+
       const { data, error } = await supabase
         .from('matches')
         .select(`
@@ -104,6 +222,7 @@ function PredictionsBoard() {
           away_team:teams!matches_away_team_id_fkey(name, elo),
           predictions(home_win_prob, draw_prob, away_win_prob, over_25_prob, predicted_score)
         `)
+        .gte('kickoff', startOfToday.toISOString())
         .order('kickoff', { ascending: true });
 
       if (!active) return;
@@ -136,6 +255,11 @@ function PredictionsBoard() {
     if (selectedDay === 'ALL') return matches;
     return matches.filter((m) => toDayKey(m.kickoff) === selectedDay);
   }, [matches, selectedDay]);
+
+  const rollover = useMemo(
+    () => buildDailyThreeOddsRollover(dayMatches),
+    [dayMatches]
+  );
 
   const leagues = useMemo(() => {
     const names = Array.from(
@@ -189,10 +313,10 @@ function PredictionsBoard() {
   }
 
   return (
-    <div className="space-y-6">
-      {/* Day Selector Bar (BettingTips.Today / Free Super Tips style) */}
+    <div className="space-y-7">
+      {/* Day Selector Bar */}
       <div className="flex flex-wrap items-center gap-2">
-        {dayKeys.map((key, idx) => {
+        {dayKeys.map((key) => {
           const active = selectedDay === key;
           return (
             <button
@@ -205,7 +329,7 @@ function PredictionsBoard() {
                   : 'bg-slate-900 text-slate-300 border-slate-800 hover:border-slate-700'
               }`}
             >
-              {formatDayTabLabel(key, idx)}
+              {formatDayTabLabel(key)}
             </button>
           );
         })}
@@ -224,6 +348,71 @@ function PredictionsBoard() {
           </button>
         )}
       </div>
+
+      {/* Dedicated Daily 3-Odds Rollover Section (Max 3 Picks, Confident Teams Only) */}
+      <section className="bg-gradient-to-br from-emerald-950/50 via-slate-900 to-slate-900 border border-emerald-700/40 rounded-2xl p-5 sm:p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+          <div>
+            <div className="inline-flex items-center gap-2 text-[11px] font-bold uppercase tracking-wider text-emerald-400">
+              <span>Daily Rollover Slip</span>
+              <span className="px-2 py-0.5 rounded bg-emerald-500/20 border border-emerald-500/40">
+                Max 3 Picks
+              </span>
+            </div>
+            <h2 className="text-lg font-extrabold text-white mt-1">
+              High-Conviction 3-Odds Rollover
+            </h2>
+            <p className="text-xs text-slate-400 mt-0.5">
+              Includes only matches with calibrated Elo separation and high model probability; uncertain teams are excluded.
+            </p>
+          </div>
+
+          {rollover.picks.length > 0 && (
+            <div className="bg-slate-950/90 border border-emerald-500/40 rounded-xl px-4 py-2.5 self-start sm:self-auto">
+              <span className="text-[10px] uppercase tracking-wider text-slate-400 block">
+                Est. Combined Odds
+              </span>
+              <span className="text-xl font-black font-mono text-emerald-400">
+                ~{rollover.combinedOdds.toFixed(2)}x
+              </span>
+            </div>
+          )}
+        </div>
+
+        {rollover.picks.length === 0 ? (
+          <div className="bg-slate-950/70 border border-slate-800 rounded-xl p-4 text-xs text-slate-400">
+            No high-confidence picks met the rollover threshold for this selection—skipping uncertain matchups rather than forcing picks.
+          </div>
+        ) : (
+          <div className="grid gap-3 md:grid-cols-3">
+            {rollover.picks.map((item, idx) => (
+              <div
+                key={item.matchId}
+                className="bg-slate-950/85 border border-slate-800 rounded-xl p-4 flex flex-col justify-between gap-3"
+              >
+                <div>
+                  <div className="flex items-center justify-between text-[11px] text-slate-400 mb-1.5">
+                    <span className="font-mono text-emerald-400 font-bold">
+                      LEG #{idx + 1}
+                    </span>
+                    <span className="truncate max-w-[150px]">{item.league}</span>
+                  </div>
+                  <div className="text-sm font-bold text-white leading-snug">
+                    {item.fixtureLabel}
+                  </div>
+                </div>
+
+                <div className="pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs">
+                  <span className="font-bold text-emerald-300">{item.pickLabel}</span>
+                  <span className="font-mono text-slate-300">
+                    {(item.prob * 100).toFixed(0)}% · ~{item.impliedOdds.toFixed(2)}
+                  </span>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
       {/* League Filter Strip */}
       {leagues.length > 0 && (
@@ -287,7 +476,8 @@ function PredictionsBoard() {
               <div className="grid gap-3">
                 {leagueMatches.map((match) => {
                   const pred = getPrediction(match.predictions);
-                  const tip = getBestTip(match, pred);
+                  const resultTip = getMatchResultTip(match, pred);
+                  const goalsTip = getGoalsTipFromScoreline(pred);
                   const homeName = match.home_team?.name ?? 'Home Team';
                   const awayName = match.away_team?.name ?? 'Away Team';
 
@@ -297,7 +487,6 @@ function PredictionsBoard() {
                       className="bg-slate-900 border border-slate-800 rounded-2xl p-5 hover:border-emerald-500/40 transition-colors"
                     >
                       <div className="flex flex-col lg:flex-row lg:items-center lg:justify-between gap-4">
-                        {/* Kickoff + Teams */}
                         <div className="flex flex-col sm:flex-row sm:items-center gap-3 sm:gap-5 min-w-0">
                           <time
                             dateTime={match.kickoff}
@@ -316,27 +505,42 @@ function PredictionsBoard() {
                               {awayName}
                             </div>
                             <div className="text-xs text-slate-500 font-mono mt-0.5">
-                              {match.home_team?.elo ? `Home Elo ${Math.round(match.home_team.elo)}` : ''}
-                              {match.home_team?.elo && match.away_team?.elo ? ' · ' : ''}
-                              {match.away_team?.elo ? `Away Elo ${Math.round(match.away_team.elo)}` : ''}
+                              {match.home_team?.elo !== undefined
+                                ? `Home Elo ${Math.round(match.home_team.elo)}`
+                                : ''}
+                              {match.home_team?.elo !== undefined &&
+                              match.away_team?.elo !== undefined
+                                ? ' · '
+                                : ''}
+                              {match.away_team?.elo !== undefined
+                                ? `Away Elo ${Math.round(match.away_team.elo)}`
+                                : ''}
                             </div>
                           </div>
                         </div>
 
-                        {/* Model Tip + Scoreline */}
-                        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+                        {/* Separate 1X2 Tip + Goals Tip + Scoreline */}
+                        <div className="flex flex-wrap items-center gap-2 shrink-0">
                           {pred ? (
                             <>
-                              <div className="inline-flex items-center gap-2 bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 px-3 py-1.5 rounded-xl text-xs font-bold">
+                              <div className="inline-flex items-center gap-1.5 bg-emerald-950/80 border border-emerald-700/60 text-emerald-300 px-3 py-1.5 rounded-xl text-xs font-bold">
                                 <span className="uppercase text-[10px] tracking-wider bg-emerald-500 text-slate-950 px-1.5 py-0.5 rounded font-black">
-                                  TIP
+                                  1X2 TIP
                                 </span>
-                                <span>{tip.label}</span>
-                                {tip.confidence && (
-                                  <span className="font-mono text-emerald-400">
-                                    ({tip.confidence})
-                                  </span>
-                                )}
+                                <span>{resultTip.label}</span>
+                                <span className="font-mono text-emerald-400">
+                                  ({(resultTip.prob * 100).toFixed(0)}%)
+                                </span>
+                              </div>
+
+                              <div className="inline-flex items-center gap-1.5 bg-amber-950/50 border border-amber-700/50 text-amber-300 px-3 py-1.5 rounded-xl text-xs font-bold">
+                                <span className="uppercase text-[10px] tracking-wider bg-amber-400 text-slate-950 px-1.5 py-0.5 rounded font-black">
+                                  GOALS
+                                </span>
+                                <span>{goalsTip.label}</span>
+                                <span className="font-mono text-amber-400">
+                                  ({(goalsTip.prob * 100).toFixed(0)}%)
+                                </span>
                               </div>
 
                               <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs">
@@ -402,7 +606,7 @@ export default function Home() {
             SportyPredictor
           </h1>
           <p className="text-sm text-slate-400 mt-1">
-            Daily Football Tips, League Breakdowns &amp; Poisson + Elo Model Picks
+            Daily Football Tips, 3-Odds Rollover Slip &amp; Poisson + Elo Model Picks
           </p>
         </header>
 

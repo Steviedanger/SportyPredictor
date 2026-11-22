@@ -26,47 +26,61 @@ def poisson_probability(lmbda: float, k: int) -> float:
 
 
 def calculate_match_probabilities(home_elo: float, away_elo: float) -> dict:
-    """Simple Elo-blended Poisson model to estimate match outcomes and goal expectancies."""
+    """
+    Elo-scaled Poisson model where 1X2, Over 2.5, and predicted_score
+    all derive directly from the same scoreline probability matrix.
+    """
     elo_diff = home_elo - away_elo
-    base_home_goals = 1.4 + (elo_diff / 400.0)
-    base_away_goals = 1.1 - (elo_diff / 400.0)
+    strength_factor = 10.0 ** (elo_diff / 400.0)
 
-    home_lambda = max(0.5, base_home_goals)
-    away_lambda = max(0.5, base_away_goals)
+    # Dynamic expected goals per side (allows total expected goals to move above/below 2.5)
+    home_lambda = max(0.35, min(3.8, 1.35 * math.sqrt(strength_factor)))
+    away_lambda = max(0.30, min(3.4, 1.05 / math.sqrt(strength_factor)))
+
+    max_goals = 6
+    grid: list[tuple[int, int, float]] = []
+    total_mass = 0.0
+
+    for h in range(max_goals + 1):
+        p_h = poisson_probability(home_lambda, h)
+        for a in range(max_goals + 1):
+            p = p_h * poisson_probability(away_lambda, a)
+            grid.append((h, a, p))
+            total_mass += p
+
+    # Normalize across the scoreline grid so probabilities stay consistent
+    normalized_grid = [
+        (h, a, p / total_mass) for (h, a, p) in grid if total_mass > 0
+    ]
 
     home_win_prob = 0.0
     draw_prob = 0.0
     away_win_prob = 0.0
     over_25_prob = 0.0
 
-    max_goals = 6
-    best_score = (1, 1)
-    max_score_prob = -1.0
+    best_h, best_a, max_score_prob = 1, 1, -1.0
 
-    for h in range(max_goals + 1):
-        for a in range(max_goals + 1):
-            p = poisson_probability(home_lambda, h) * poisson_probability(away_lambda, a)
+    for h, a, p in normalized_grid:
+        if h > a:
+            home_win_prob += p
+        elif h == a:
+            draw_prob += p
+        else:
+            away_win_prob += p
 
-            if h > a:
-                home_win_prob += p
-            elif h == a:
-                draw_prob += p
-            else:
-                away_win_prob += p
+        if (h + a) > 2.5:
+            over_25_prob += p
 
-            if h + a > 2.5:
-                over_25_prob += p
-
-            if p > max_score_prob:
-                max_score_prob = p
-                best_score = (h, a)
+        if p > max_score_prob:
+            max_score_prob = p
+            best_h, best_a = h, a
 
     return {
         "home_win": round(home_win_prob, 3),
         "draw": round(draw_prob, 3),
         "away_win": round(away_win_prob, 3),
         "over_25": round(over_25_prob, 3),
-        "predicted_score": f"{best_score[0]}-{best_score[1]}",
+        "predicted_score": f"{best_h}-{best_a}",
     }
 
 
@@ -87,7 +101,6 @@ def generate_predictions() -> None:
         log.info("No upcoming scheduled matches found to predict.")
         return
 
-    # Load all team Elo ratings in one query instead of 2 queries per match
     teams_res = SUPABASE.table("teams").select("id, elo").execute()
     elo_map: dict[int, float] = {
         t["id"]: float(t["elo"]) if t.get("elo") is not None else 1500.0
