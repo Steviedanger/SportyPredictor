@@ -19,6 +19,9 @@ if not SUPABASE_URL or not SUPABASE_KEY:
 
 SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+# Bump this whenever the model changes, so results of different models are never mixed.
+MODEL_VERSION = "elo-poisson-v1"
+
 
 def poisson_probability(lmbda: float, k: int) -> float:
     """Calculates the Poisson probability of k events occurring given expected rate lmbda."""
@@ -108,6 +111,7 @@ def generate_predictions() -> None:
     }
 
     predictions_batch: list[dict] = []
+    log_batch: list[dict] = []
 
     for m in matches:
         home_elo = elo_map.get(m["home_team_id"], 1500.0)
@@ -126,6 +130,24 @@ def generate_predictions() -> None:
             }
         )
 
+        # Permanent record of what the model said before kickoff. `first_predicted_at`
+        # is left out on purpose so the database keeps the original timestamp.
+        log_batch.append(
+            {
+                "match_id": m["id"],
+                "model_version": MODEL_VERSION,
+                "kickoff": m["kickoff"],
+                "last_updated_at": now_iso,
+                "home_elo": round(home_elo, 2),
+                "away_elo": round(away_elo, 2),
+                "home_win_prob": preds["home_win"],
+                "draw_prob": preds["draw"],
+                "away_win_prob": preds["away_win"],
+                "over_25_prob": preds["over_25"],
+                "predicted_score": preds["predicted_score"],
+            }
+        )
+
     SUPABASE.table("predictions").upsert(
         predictions_batch,
         on_conflict="match_id",
@@ -135,6 +157,16 @@ def generate_predictions() -> None:
         "Phase 2 Prediction generation complete! Upserted %d upcoming predictions.",
         len(predictions_batch),
     )
+
+    # A logging problem must never block the live predictions, but it must be loud.
+    try:
+        SUPABASE.table("prediction_log").upsert(
+            log_batch,
+            on_conflict="match_id",
+        ).execute()
+        log.info("Prediction log updated for %d upcoming matches.", len(log_batch))
+    except Exception as exc:
+        log.error("Could not write prediction_log (live predictions were saved): %s", exc)
 
 
 if __name__ == "__main__":

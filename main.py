@@ -2,6 +2,7 @@ import logging
 from scraper import ingest_teams_and_fixtures
 from elo_updater import update_elo_ratings
 from predictor import generate_predictions
+from grader import grade_finished_predictions
 
 logging.basicConfig(
     level=logging.INFO,
@@ -25,6 +26,13 @@ def run_pipeline() -> None:
 
         logger.info("--- Step 3: Running Poisson + Elo prediction engine ---")
         generate_predictions()
+
+        logger.info("--- Step 4: Grading finished matches against logged predictions ---")
+        try:
+            grade_finished_predictions()
+        except Exception as exc:
+            # Grading can always catch up on the next run.
+            logger.error("Grading failed, will retry next run: %s", exc)
 
         logger.info("SportyPredictor pipeline completed successfully!")
     except Exception as exc:
