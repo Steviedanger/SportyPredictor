@@ -606,8 +606,8 @@ export default function Home() {
     <main className="min-h-screen bg-slate-950 text-slate-100 px-4 py-10 md:px-10">
       <div className="max-w-5xl mx-auto">
         <header className="pb-6 mb-6 border-b border-slate-800">
-          <h1 className="text-3xl font-extrabold tracking-tight text-emerald-400">
-            SportyPredictor
+          <h1 className="text-3xl font-extrabold tracking-tight text-white">
+            Sporty<span className="text-emerald-400">Predictor</span>
           </h1>
           <p className="text-sm text-slate-400 mt-1">
             Daily Football Tips, 3-Odds Rollover Slip &amp; Poisson + Elo Model Picks
