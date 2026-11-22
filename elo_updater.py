@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
-from datetime import datetime, timedelta, timezone
+import time
+from datetime import datetime, timezone
+
 import requests
 from dotenv import load_dotenv
 from supabase import Client, create_client
@@ -24,37 +27,91 @@ if not SUPABASE_URL or not SUPABASE_KEY or not FOOTBALL_DATA_API_KEY:
 
 SUPABASE: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-TARGET_COMPETITIONS = ["PL", "PD", "BL1", "SA", "FL1", "CL", "BSA"]
-LOOKBACK_DAYS = 45
-K_FACTOR = 24.0
+BASE_URL = "https://api.football-data.org/v4"
+
+# European competitions use a season that starts in summer (season=2026 means 2026/27).
+EUROPEAN_COMPETITIONS = ["PL", "PD", "BL1", "SA", "FL1", "CL"]
+# Brazil's Serie A runs on the calendar year.
+CALENDAR_YEAR_COMPETITIONS = ["BSA"]
+
+# How many seasons to replay besides the current one (1 = current + previous).
+PREVIOUS_SEASONS = 1
+
+# Free tier allows ~10 requests per minute; stay safely under it.
+REQUEST_PAUSE_SECONDS = 6.5
+RATE_LIMIT_WAIT_SECONDS = 65
+
+K_FACTOR = 20.0
 HOME_ADVANTAGE = 60.0
 DEFAULT_ELO = 1500.0
 
 
-def fetch_finished_matches() -> list[dict]:
-    now_utc = datetime.now(timezone.utc)
-    date_from = (now_utc - timedelta(days=LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    date_to = now_utc.strftime("%Y-%m-%d")
+def season_years(code: str, now: datetime) -> list[int]:
+    """Season start years to fetch for a competition, oldest first."""
+    if code in CALENDAR_YEAR_COMPETITIONS:
+        current = now.year
+    else:
+        current = now.year if now.month >= 7 else now.year - 1
+    return [current - offset for offset in range(PREVIOUS_SEASONS, -1, -1)]
 
-    url = "https://api.football-data.org/v4/matches"
+
+def fetch_competition_season(code: str, season: int) -> list[dict]:
+    """Fetch all FINISHED matches for one competition and season. Never raises."""
+    url = f"{BASE_URL}/competitions/{code}/matches"
     headers = {"X-Auth-Token": FOOTBALL_DATA_API_KEY}
-    params = {
-        "competitions": ",".join(TARGET_COMPETITIONS),
-        "dateFrom": date_from,
-        "dateTo": date_to,
-        "status": "FINISHED",
-    }
+    params = {"season": season, "status": "FINISHED"}
 
-    log.info(
-        "Fetching finished matches from Football-Data.org (%s to %s)...",
-        date_from,
-        date_to,
-    )
+    for attempt in range(2):
+        try:
+            response = requests.get(url, headers=headers, params=params, timeout=30)
+        except requests.RequestException as exc:
+            log.warning("%s %s: request failed (%s). Skipping.", code, season, exc)
+            return []
 
-    response = requests.get(url, headers=headers, params=params, timeout=30)
-    response.raise_for_status()
-    payload = response.json()
-    matches = payload.get("matches", [])
+        if response.status_code == 429 and attempt == 0:
+            log.warning(
+                "%s %s: rate limited, waiting %ds and retrying once.",
+                code,
+                season,
+                RATE_LIMIT_WAIT_SECONDS,
+            )
+            time.sleep(RATE_LIMIT_WAIT_SECONDS)
+            continue
+
+        if response.status_code != 200:
+            log.warning(
+                "%s %s: HTTP %s body=%s. Skipping.",
+                code,
+                season,
+                response.status_code,
+                response.text[:300],
+            )
+            return []
+
+        matches = response.json().get("matches", [])
+        log.info("%s %s: fetched %d finished matches.", code, season, len(matches))
+        return matches
+
+    return []
+
+
+def fetch_all_finished_matches() -> list[dict]:
+    now = datetime.now(timezone.utc)
+    all_matches: dict[int, dict] = {}
+    first_request = True
+
+    for code in EUROPEAN_COMPETITIONS + CALENDAR_YEAR_COMPETITIONS:
+        for season in season_years(code, now):
+            if not first_request:
+                time.sleep(REQUEST_PAUSE_SECONDS)
+            first_request = False
+
+            for m in fetch_competition_season(code, season):
+                match_id = m.get("id")
+                if match_id is not None:
+                    all_matches[int(match_id)] = m
+
+    matches = list(all_matches.values())
     matches.sort(key=lambda m: m.get("utcDate") or "")
     return matches
 
@@ -63,25 +120,32 @@ def expected_score(rating_a: float, rating_b: float) -> float:
     return 1.0 / (1.0 + 10.0 ** ((rating_b - rating_a) / 400.0))
 
 
+def goal_diff_multiplier(goal_diff: int) -> float:
+    """Bigger wins move ratings more (standard football-Elo scaling)."""
+    gd = abs(goal_diff)
+    if gd <= 1:
+        return 1.0
+    if gd == 2:
+        return 1.5
+    return (11.0 + gd) / 8.0
+
+
 def update_elo_ratings() -> None:
-    finished_matches = fetch_finished_matches()
-    log.info("Found %d finished matches to process for Elo updates.", len(finished_matches))
+    """
+    Recompute every rating from scratch: start all teams at DEFAULT_ELO, replay the
+    full history in date order, then overwrite `teams.elo`. Because nothing is read
+    back from the database, running this twice gives identical results.
+    """
+    finished_matches = fetch_all_finished_matches()
+    log.info("Replaying %d finished matches for Elo.", len(finished_matches))
 
     if not finished_matches:
+        log.warning("No finished matches fetched; leaving existing ratings untouched.")
         return
 
-    # Ensure all teams appearing in finished matches exist in `teams` and load current Elo
-    teams_res = SUPABASE.table("teams").select("id, name, elo").execute()
-    elo_by_id: dict[int, float] = {}
-    name_by_id: dict[int, str] = {}
-
-    for row in teams_res.data or []:
-        tid = int(row["id"])
-        elo_by_id[tid] = float(row["elo"]) if row.get("elo") is not None else DEFAULT_ELO
-        name_by_id[tid] = row.get("name") or f"Team {tid}"
-
-    touched_team_ids: set[int] = set()
-    applied_count = 0
+    elo: dict[int, float] = {}
+    names: dict[int, str] = {}
+    applied = 0
 
     for m in finished_matches:
         home = m.get("homeTeam") or {}
@@ -89,26 +153,20 @@ def update_elo_ratings() -> None:
         home_id = home.get("id")
         away_id = away.get("id")
 
-        score = m.get("score") or {}
-        full_time = score.get("fullTime") or {}
+        full_time = (m.get("score") or {}).get("fullTime") or {}
         home_goals = full_time.get("home")
         away_goals = full_time.get("away")
 
         if not home_id or not away_id or home_goals is None or away_goals is None:
             continue
 
-        home_id = int(home_id)
-        away_id = int(away_id)
-        home_goals = int(home_goals)
-        away_goals = int(away_goals)
+        home_id, away_id = int(home_id), int(away_id)
+        home_goals, away_goals = int(home_goals), int(away_goals)
 
-        if home_id not in elo_by_id:
-            elo_by_id[home_id] = DEFAULT_ELO
-            name_by_id[home_id] = home.get("name") or home.get("shortName") or f"Team {home_id}"
-
-        if away_id not in elo_by_id:
-            elo_by_id[away_id] = DEFAULT_ELO
-            name_by_id[away_id] = away.get("name") or away.get("shortName") or f"Team {away_id}"
+        for tid, team in ((home_id, home), (away_id, away)):
+            if tid not in elo:
+                elo[tid] = DEFAULT_ELO
+                names[tid] = team.get("name") or team.get("shortName") or f"Team {tid}"
 
         if home_goals > away_goals:
             actual_home = 1.0
@@ -117,39 +175,40 @@ def update_elo_ratings() -> None:
         else:
             actual_home = 0.0
 
-        exp_home = expected_score(elo_by_id[home_id] + HOME_ADVANTAGE, elo_by_id[away_id])
-        delta = K_FACTOR * (actual_home - exp_home)
+        exp_home = expected_score(elo[home_id] + HOME_ADVANTAGE, elo[away_id])
+        delta = (
+            K_FACTOR
+            * goal_diff_multiplier(home_goals - away_goals)
+            * (actual_home - exp_home)
+        )
 
-        elo_by_id[home_id] = round(elo_by_id[home_id] + delta, 2)
-        elo_by_id[away_id] = round(elo_by_id[away_id] - delta, 2)
+        elo[home_id] += delta
+        elo[away_id] -= delta
+        applied += 1
 
-        touched_team_ids.add(home_id)
-        touched_team_ids.add(away_id)
-        applied_count += 1
-
-    if not touched_team_ids:
-        log.info("No valid full-time match scores found to update Elo.")
+    if not elo:
+        log.warning("No valid full-time scores found; leaving existing ratings untouched.")
         return
 
-    # First upsert any newly seen teams so foreign keys / rows exist, then update Elo
-    team_updates = [
-        {
-            "id": tid,
-            "name": name_by_id.get(tid, f"Team {tid}"),
-            "elo": elo_by_id[tid],
-        }
-        for tid in touched_team_ids
+    rows = [
+        {"id": tid, "name": names[tid], "elo": round(rating, 2)}
+        for tid, rating in elo.items()
     ]
 
-    SUPABASE.table("teams").upsert(
-        team_updates,
-        on_conflict="id",
-    ).execute()
+    batch_size = 200
+    for start in range(0, len(rows), batch_size):
+        SUPABASE.table("teams").upsert(
+            rows[start : start + batch_size],
+            on_conflict="id",
+        ).execute()
 
+    ratings = sorted(elo.values())
     log.info(
-        "Elo update complete: replayed %d finished matches and updated %d teams in Supabase.",
-        applied_count,
-        len(team_updates),
+        "Elo update complete: %d matches replayed, %d teams written (min %.0f, max %.0f).",
+        applied,
+        len(rows),
+        ratings[0],
+        ratings[-1],
     )
 
 

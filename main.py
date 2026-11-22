@@ -17,7 +17,11 @@ def run_pipeline() -> None:
         ingest_teams_and_fixtures()
 
         logger.info("--- Step 2: Updating team Elo ratings from finished matches ---")
-        update_elo_ratings()
+        try:
+            update_elo_ratings()
+        except Exception as exc:
+            # Don't let a rating failure block predictions; use the ratings we already have.
+            logger.error("Elo update failed, continuing with existing ratings: %s", exc)
 
         logger.info("--- Step 3: Running Poisson + Elo prediction engine ---")
         generate_predictions()
