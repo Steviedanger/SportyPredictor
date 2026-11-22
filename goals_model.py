@@ -49,18 +49,30 @@ def _poisson_pmf(lam: float, k: int) -> float:
     return math.exp(-lam + k * math.log(lam) - math.lgamma(k + 1))
 
 
+def _outcome(h: int, a: int) -> str:
+    return "H" if h > a else "D" if h == a else "A"
+
+
 def score_summary(lam_h: float, lam_a: float, max_goals: int = MAX_GOALS) -> dict:
-    """1X2, over 2.5 and likeliest score, all from one scoreline grid."""
+    """
+    1X2, over 2.5 and a suggested score, all from one scoreline grid.
+
+    The suggested score is the most likely scoreline that agrees with the picked 1X2
+    result AND the picked Over/Under 2.5 side, so the card never contradicts itself
+    (the single likeliest scoreline is almost always 1-0 or 1-1, even when Over 2.5
+    is favoured). `likeliest_score` keeps that raw single most likely cell.
+    """
     home_pmf = [_poisson_pmf(lam_h, k) for k in range(max_goals + 1)]
     away_pmf = [_poisson_pmf(lam_a, k) for k in range(max_goals + 1)]
     mass = sum(home_pmf) * sum(away_pmf)
 
+    cells: list[tuple[float, int, int]] = []
     home_win = draw = away_win = over_25 = 0.0
-    best_p, best_score = -1.0, (1, 1)
 
     for h, ph in enumerate(home_pmf):
         for a, pa in enumerate(away_pmf):
             p = ph * pa / mass
+            cells.append((p, h, a))
             if h > a:
                 home_win += p
             elif h == a:
@@ -69,15 +81,27 @@ def score_summary(lam_h: float, lam_a: float, max_goals: int = MAX_GOALS) -> dic
                 away_win += p
             if h + a > 2.5:
                 over_25 += p
-            if p > best_p:
-                best_p, best_score = p, (h, a)
+
+    # Decide the picks from the same rounded numbers the page will display, with the
+    # same tie rules as the page (first listed wins: home, draw, away; Over at 50%).
+    rounded = [("H", round(home_win, 3)), ("D", round(draw, 3)), ("A", round(away_win, 3))]
+    pick = max(rounded, key=lambda t: t[1])[0]
+    over_side = round(over_25, 3) >= 0.5
+
+    consistent = [
+        c for c in cells
+        if _outcome(c[1], c[2]) == pick and ((c[1] + c[2]) > 2.5) == over_side
+    ]
+    _, best_h, best_a = max(consistent)
+    _, raw_h, raw_a = max(cells)
 
     return {
         "home_win": home_win,
         "draw": draw,
         "away_win": away_win,
         "over_25": over_25,
-        "predicted_score": f"{best_score[0]}-{best_score[1]}",
+        "predicted_score": f"{best_h}-{best_a}",
+        "likeliest_score": f"{raw_h}-{raw_a}",
         "home_xg": lam_h,
         "away_xg": lam_a,
     }

@@ -35,7 +35,7 @@ interface RolloverPick {
   fixtureLabel: string;
   pickLabel: string;
   prob: number;
-  impliedOdds: number;
+  modelOdds: number;
 }
 
 function getPrediction(preds: MatchRow['predictions']): Prediction | null {
@@ -81,6 +81,7 @@ function isConfidentTeamElo(elo?: number): boolean {
 function buildDailyThreeOddsRollover(matches: MatchRow[]): {
   picks: RolloverPick[];
   combinedOdds: number;
+  combinedProb: number;
 } {
   const candidates: RolloverPick[] = [];
 
@@ -113,9 +114,9 @@ function buildDailyThreeOddsRollover(matches: MatchRow[]): {
     // Require solid conviction so uncertain fixtures never enter the 3-odds rollover
     if (topMarket.prob < 0.54) continue;
 
-    // Approximate decimal odds with a modest margin factor (~0.92)
-    const rawFairOdds = topMarket.prob > 0 ? 1 / topMarket.prob : 1;
-    const impliedOdds = Number(Math.max(1.12, rawFairOdds * 0.92).toFixed(2));
+    // Model "fair" odds = 1 / probability. These are NOT bookmaker prices.
+    // (topMarket.prob is at least 0.54 here, so there is no division by zero.)
+    const modelOdds = Number((1 / topMarket.prob).toFixed(2));
 
     candidates.push({
       matchId: match.id,
@@ -124,7 +125,7 @@ function buildDailyThreeOddsRollover(matches: MatchRow[]): {
       fixtureLabel: `${homeName} vs ${awayName}`,
       pickLabel: topMarket.label,
       prob: topMarket.prob,
-      impliedOdds,
+      modelOdds,
     });
   }
 
@@ -136,16 +137,20 @@ function buildDailyThreeOddsRollover(matches: MatchRow[]): {
 
   for (const pick of candidates) {
     if (selected.length >= 3) break;
-    const nextOdds = runningOdds * pick.impliedOdds;
+    const nextOdds = runningOdds * pick.modelOdds;
     // Avoid blowing past ~3.60x if we already have 2 solid picks near 3.00x
     if (selected.length >= 2 && nextOdds > 3.6) continue;
     selected.push(pick);
     runningOdds = nextOdds;
   }
 
+  // Chance that every leg wins, assuming the matches are independent.
+  const combinedProb = selected.reduce((acc, pick) => acc * pick.prob, 1);
+
   return {
     picks: selected,
     combinedOdds: Number(runningOdds.toFixed(2)),
+    combinedProb,
   };
 }
 
@@ -350,17 +355,20 @@ function PredictionsBoard() {
               High-Conviction 3-Odds Rollover
             </h2>
             <p className="text-xs text-slate-400 mt-0.5">
-              Includes only matches with calibrated Elo separation and high model probability; uncertain teams are excluded.
+              The model's strongest picks for the day. Odds shown are the model's own fair odds (1 ÷ probability), not bookmaker prices.
             </p>
           </div>
 
           {rollover.picks.length > 0 && (
             <div className="bg-slate-950/90 border border-emerald-500/40 rounded-xl px-4 py-2.5 self-start sm:self-auto">
               <span className="text-[10px] uppercase tracking-wider text-slate-400 block">
-                Est. Combined Odds
+                Model Combined Odds
               </span>
               <span className="text-xl font-black font-mono text-emerald-400">
                 ~{rollover.combinedOdds.toFixed(2)}x
+              </span>
+              <span className="text-[10px] text-slate-400 block mt-0.5">
+                All {rollover.picks.length} win: {(rollover.combinedProb * 100).toFixed(0)}% (model)
               </span>
             </div>
           )}
@@ -392,7 +400,7 @@ function PredictionsBoard() {
                 <div className="pt-2.5 border-t border-slate-800/80 flex items-center justify-between text-xs">
                   <span className="font-bold text-emerald-300">{item.pickLabel}</span>
                   <span className="font-mono text-slate-300">
-                    {(item.prob * 100).toFixed(0)}% · ~{item.impliedOdds.toFixed(2)}
+                    {(item.prob * 100).toFixed(0)}% · ~{item.modelOdds.toFixed(2)}
                   </span>
                 </div>
               </div>
@@ -540,7 +548,7 @@ function PredictionsBoard() {
                               )}
 
                               <div className="bg-slate-950 border border-slate-800 px-3 py-1.5 rounded-xl text-xs">
-                                <span className="text-slate-400 mr-1.5">Likeliest score:</span>
+                                <span className="text-slate-400 mr-1.5">Suggested score:</span>
                                 <span className="font-mono font-bold text-slate-100">
                                   {pred.predicted_score}
                                 </span>
@@ -615,6 +623,13 @@ export default function Home() {
         >
           <PredictionsBoard />
         </Suspense>
+
+        <footer className="mt-10 pt-5 border-t border-slate-800 text-[11px] leading-relaxed text-slate-500">
+          SportyPredictor shows statistical model probabilities, not guarantees. Odds are
+          calculated by the model and are not bookmaker prices, so real odds will differ.
+          Past results do not predict future ones. For adults 18+ only. Never bet more than
+          you can afford to lose.
+        </footer>
       </div>
     </main>
   );
